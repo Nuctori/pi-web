@@ -3,18 +3,112 @@ import {
   buildContextEntries as piBuildContextEntries,
   getAgentDir,
 } from "@earendil-works/pi-coding-agent";
-import { closeSync, type Dirent, openSync, readSync } from "fs";
+import { closeSync, type Dirent, fstatSync, openSync, readSync } from "fs";
 import { readdir } from "fs/promises";
 import { isAbsolute, join, normalize as normalizePath, relative, resolve as resolvePath, sep } from "path";
 import type { AgentMessage, ImageContent, SessionEntry, SessionHeader, SessionInfo, SessionContext } from "./types";
-import type { SessionEntry as PiSessionEntry, SessionInfo as PiSessionInfo } from "@earendil-works/pi-coding-agent";
+import type { SessionEntry as PiSessionEntry } from "@earendil-works/pi-coding-agent";
 import { normalizeToolCalls } from "./normalize";
 import { projectIdentityKey } from "./project-identity";
 import { sessionPathKey } from "./session-path";
 import { MAX_TOOL_RESULT_IMAGE_BYTES, TOOL_RESULT_IMAGE_MIMES } from "./tool-result-images";
 import { resolveProject, type ProjectInfo } from "./worktree";
+import { readSubagentRun, SUBAGENT_META_TYPE } from "./subagents";
+import { listSessionsIncremental } from "./session-list-scanner";
 
 export { getAgentDir };
+
+const SESSION_HEADER_MAX_BYTES = 64 * 1024;
+const SESSION_RELATION_MAX_BYTES = 256 * 1024;
+const SESSION_RELATION_MAX_LINES = 2;
+const SESSION_RESULT_MAX_BYTES = 256 * 1024;
+
+function readBoundedLines(filePath: string, maxBytes: number, maxLines: number): string[] {
+  const fd = openSync(filePath, "r");
+  try {
+    const chunks: Buffer[] = [];
+    let position = 0;
+    let newlineCount = 0;
+    let reachedEof = false;
+
+    while (position < maxBytes && newlineCount < maxLines) {
+      const buffer = Buffer.allocUnsafe(Math.min(4096, maxBytes - position));
+      const bytesRead = readSync(fd, buffer, 0, buffer.length, position);
+      if (bytesRead === 0) {
+        reachedEof = true;
+        break;
+      }
+      position += bytesRead;
+      const data = buffer.subarray(0, bytesRead);
+      let end = data.length;
+      for (let index = 0; index < data.length; index += 1) {
+        if (data[index] !== 0x0a) continue;
+        newlineCount += 1;
+        if (newlineCount === maxLines) {
+          end = index + 1;
+          break;
+        }
+      }
+      chunks.push(data.subarray(0, end));
+    }
+
+    const source = Buffer.concat(chunks).toString("utf8");
+    const lines = source.split("\n");
+    if (!reachedEof && !source.endsWith("\n")) lines.pop();
+    if (lines.at(-1) === "") lines.pop();
+    return lines.map((line) => line.endsWith("\r") ? line.slice(0, -1) : line);
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function readBoundedTailLines(filePath: string, maxBytes: number): string[] {
+  const fd = openSync(filePath, "r");
+  try {
+    const fileSize = fstatSync(fd).size;
+    const start = Math.max(0, fileSize - maxBytes);
+    const buffer = Buffer.allocUnsafe(fileSize - start);
+    const bytesRead = readSync(fd, buffer, 0, buffer.length, start);
+    if (bytesRead === 0) return [];
+
+    const lines = buffer.subarray(0, bytesRead).toString("utf8").split("\n");
+    if (start > 0) {
+      const previousByte = Buffer.allocUnsafe(1);
+      readSync(fd, previousByte, 0, 1, start - 1);
+      if (previousByte[0] !== 0x0a) lines.shift();
+    }
+    if (lines.at(-1) === "") lines.pop();
+    return lines.map((line) => line.endsWith("\r") ? line.slice(0, -1) : line);
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function parseSessionEntries(lines: readonly string[]): SessionEntry[] {
+  return lines.flatMap((line) => {
+    try {
+      const entry = JSON.parse(line) as SessionEntry;
+      return [entry];
+    } catch {
+      return [];
+    }
+  });
+}
+
+function readSessionRelationEntries(filePath: string): SessionEntry[] {
+  const prefixEntries = parseSessionEntries(
+    readBoundedLines(filePath, SESSION_RELATION_MAX_BYTES, SESSION_RELATION_MAX_LINES).slice(1),
+  );
+  const isSubagent = prefixEntries.some((entry) => (
+    entry.type === "custom" && entry.customType === SUBAGENT_META_TYPE
+  ));
+  if (!isSubagent) return prefixEntries;
+
+  return [
+    ...prefixEntries,
+    ...parseSessionEntries(readBoundedTailLines(filePath, SESSION_RESULT_MAX_BYTES)),
+  ];
+}
 
 export async function attachSessionProjectInfo(sessions: SessionInfo[]): Promise<SessionInfo[]> {
   const uniqueCwds = [...new Set(sessions.map((s) => s.cwd).filter(Boolean))];
@@ -30,7 +124,8 @@ export async function attachSessionProjectInfo(sessions: SessionInfo[]): Promise
       ...session,
       projectRoot,
       projectKey: projectIdentityKey(projectRoot),
-      ...(project?.isWorktree && project.branch ? { worktreeBranch: project.branch } : {}),
+      ...(project?.branch ? { branch: project.branch } : {}),
+      ...(project?.isWorktree ? { isWorktree: true } : {}),
     };
   });
 }
@@ -47,22 +142,34 @@ export function mergeSessionLists(
 }
 
 async function loadAllSessions(): Promise<SessionInfo[]> {
-  const piSessions: PiSessionInfo[] = await SessionManager.listAll();
+  const scanned = await listSessionsIncremental();
   const pathToId = new Map<string, string>();
-  for (const s of piSessions) pathToId.set(sessionPathKey(s.path), s.id);
+  for (const s of scanned) pathToId.set(sessionPathKey(s.path), s.id);
 
-  const sessions = piSessions.map((s) => {
+  const sessions = scanned.map((s) => {
     cacheSessionPath(s.id, s.path);
+    const originSessionId = s.parentSessionPath ? pathToId.get(sessionPathKey(s.parentSessionPath)) : undefined;
+    let subagent = null;
+    if (s.parentSessionPath) {
+      try {
+        subagent = readSubagentRun(readSessionRelationEntries(s.path), s.id, s.path);
+      } catch { /* malformed or concurrently removed session */ }
+    }
     return {
       path: s.path,
       id: s.id,
       cwd: s.cwd,
       name: s.name,
-      created: s.created instanceof Date ? s.created.toISOString() : String(s.created),
-      modified: s.modified instanceof Date ? s.modified.toISOString() : String(s.modified),
+      created: s.created.toISOString(),
+      modified: s.modified.toISOString(),
       messageCount: s.messageCount,
       firstMessage: s.firstMessage || "(no messages)",
-      parentSessionId: s.parentSessionPath ? pathToId.get(sessionPathKey(s.parentSessionPath)) : undefined,
+      parentSessionId: originSessionId,
+      ...(subagent
+        ? { relation: { kind: "subagent" as const, parentSessionId: subagent.parentSessionId, profile: subagent.profile, description: subagent.description, status: subagent.status } }
+        : s.parentSessionPath
+          ? { relation: { kind: "fork" as const, ...(originSessionId ? { originSessionId } : {}) } }
+          : {}),
       transient: false,
     };
   });
@@ -285,41 +392,109 @@ export function invalidateSessionPathCache(sessionId: string): void {
 }
 
 export function readSessionHeader(filePath: string): SessionHeader | null {
-  const fd = openSync(filePath, "r");
+  const firstLine = readBoundedLines(filePath, SESSION_HEADER_MAX_BYTES, 1)[0]?.trimEnd();
+  if (!firstLine) return null;
   try {
-    const chunks: Buffer[] = [];
-    const maxHeaderBytes = 64 * 1024;
-    let position = 0;
-    let foundNewline = false;
-
-    while (position < maxHeaderBytes && !foundNewline) {
-      const buffer = Buffer.allocUnsafe(Math.min(4096, maxHeaderBytes - position));
-      const bytesRead = readSync(fd, buffer, 0, buffer.length, position);
-      if (bytesRead === 0) break;
-      const data = buffer.subarray(0, bytesRead);
-      const newlineIndex = data.indexOf(0x0a);
-      chunks.push(newlineIndex === -1 ? data : data.subarray(0, newlineIndex));
-      position += bytesRead;
-      foundNewline = newlineIndex !== -1;
-    }
-
-    if (!foundNewline && position >= maxHeaderBytes) return null;
-    const firstLine = Buffer.concat(chunks).toString("utf8").trimEnd();
-    if (!firstLine) return null;
-    try {
-      const header = JSON.parse(firstLine) as SessionHeader;
-      return header.type === "session" ? header : null;
-    } catch {
-      return null;
-    }
-  } finally {
-    closeSync(fd);
+    const header = JSON.parse(firstLine) as SessionHeader;
+    return header.type === "session" ? header : null;
+  } catch {
+    return null;
   }
 }
 
 export function getSessionEntries(filePath: string): SessionEntry[] {
   const entries = SessionManager.open(filePath).getEntries();
   return entries as unknown as SessionEntry[];
+}
+
+/**
+ * Reverse-stream the active branch of an append-only JSONL session.
+ *
+ * `SessionManager.open().getEntries()` parses the whole file, which costs
+ * seconds on multi-MB sessions. When the caller only needs the last `tail`
+ * entries reachable from `leafId`, we can read the file backwards, parse each
+ * line on the fly, and walk the `parentId` chain — O(tail) bytes for huge
+ * files. Falls back to the SDK loader on any structural surprise.
+ *
+ * Iterative by design: a linear session's chain length equals its entry
+ * count, so a recursive walk would overflow the call stack.
+ */
+export function loadRecentEntries(
+  filePath: string,
+  options: { leafId?: string | null; tail?: number; excludeLeaf?: boolean } = {},
+): SessionEntry[] {
+  const tail = options.tail && options.tail > 0 ? Math.min(options.tail, 1000) : 50;
+  const excludeLeaf = options.excludeLeaf === true;
+  const SCAN_CHUNK = 1 << 20; // 1 MiB forward chunks; the tail block is one
+  const fd = openSync(filePath, "r");
+  try {
+    const fileSize = fstatSync(fd).size;
+    if (fileSize === 0) return [];
+
+    // 1. Read the last chunk; it should contain the last entry (leaf) and
+    //    usually enough earlier lines to finish the parentId walk in-memory.
+    let end = fileSize;
+    let start = Math.max(0, end - SCAN_CHUNK);
+    let chunk = Buffer.allocUnsafe(end - start);
+    readSync(fd, chunk, 0, chunk.length, start);
+
+    // 2. Pull entries out of [start, end), back-to-front, until we have
+    //    `tail` ancestors of leafId (or hit the start of the file).
+    const chain: SessionEntry[] = [];
+    const byId = new Map<string, SessionEntry>();
+    let leaf: SessionEntry | undefined;
+
+    // Sliding read of the file from the right, one SCAN_CHUNK block at a time.
+    while (true) {
+      const text = chunk.toString("utf8");
+      const lines = text.split("\n");
+      if (start > 0 && text.length > 0 && !text.endsWith("\n")) lines.pop();
+      // Iterate lines in reverse so the file's last (leaf) line is first.
+      for (let i = lines.length - 1; i >= 0; i--) {
+        const raw = lines[i].endsWith("\r") ? lines[i].slice(0, -1) : lines[i];
+        if (!raw) continue;
+        let entry: SessionEntry;
+        try { entry = JSON.parse(raw) as SessionEntry; } catch { continue; }
+        if (!entry || typeof entry.id !== "string") continue;
+        byId.set(entry.id, entry);
+        if (!leaf && (options.leafId == null || entry.id === options.leafId)) {
+          leaf = entry;
+        }
+      }
+      // Have we collected enough ancestors to satisfy the request?
+      if (leaf && countAncestors(leaf, byId) + (excludeLeaf ? 0 : 1) >= tail) break;
+      if (start === 0) break; // scanned whole file
+      end = start;
+      start = Math.max(0, end - SCAN_CHUNK);
+      const next = Buffer.allocUnsafe(end - start);
+      readSync(fd, next, 0, next.length, start);
+      // Concatenate so the next iteration sees [start, end) as a single
+      // text block; reusing the old buffer alias would leave stale tail bytes.
+      chunk = start === 0 ? next : Buffer.concat([next, chunk]);
+    }
+
+    if (!leaf) return [];
+    // 3. Walk the parent chain from leaf, collecting up to `tail` entries
+    //    (excluding leaf itself when excludeLeaf, matching sliceActiveBranch).
+    let cursor: SessionEntry | undefined = excludeLeaf
+      ? (leaf.parentId ? byId.get(leaf.parentId) : undefined)
+      : leaf;
+    while (cursor && chain.length < tail) {
+      chain.push(cursor);
+      cursor = cursor.parentId ? byId.get(cursor.parentId) : undefined;
+    }
+    chain.reverse();
+    return chain;
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function countAncestors(leaf: SessionEntry, byId: Map<string, SessionEntry>): number {
+  let n = 0;
+  let cur: SessionEntry | undefined = leaf.parentId ? byId.get(leaf.parentId) : undefined;
+  while (cur) { n += 1; cur = cur.parentId ? byId.get(cur.parentId) : undefined; }
+  return n;
 }
 
 function getSessionSettings(entries: SessionEntry[], leafId?: string | null): Pick<SessionContext, "thinkingLevel" | "model"> {
