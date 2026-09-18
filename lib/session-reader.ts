@@ -118,9 +118,8 @@ function readEntryId(line: string): string | undefined {
  * stay cheap. Undefined when the file is absent (a wrapper that has not flushed
  * its first assistant turn yet) or unreadable.
  *
- * Used to detect appends made by another pi process: the TUI writes the same
- * session file pi-web is browsing, and an id the in-memory wrapper never saw
- * means that wrapper no longer reflects the file.
+ * Used only on ?force=1 session reads (mount / page refresh). An id the
+ * in-memory wrapper never saw means another pi process appended to the file.
  */
 export function readLatestSessionEntryId(filePath: string | undefined): string | undefined {
   if (!filePath) return undefined;

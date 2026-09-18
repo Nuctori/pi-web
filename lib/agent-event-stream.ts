@@ -7,6 +7,7 @@ import {
 export interface AgentEventStreamSession {
   readonly isStreaming: boolean;
   readonly streamingMessage: unknown;
+  isAlive?(): boolean;
   onEvent(listener: (event: AgentEventLike) => void): () => void;
 }
 
@@ -69,10 +70,18 @@ export function createAgentEventStream(
         try {
           const session = await sessionPromise;
           if (closed) return;
+          if (session.isAlive && !session.isAlive()) {
+            cleanup(true);
+            return;
+          }
 
           const bufferedEvents: AgentEventLike[] = [];
           let snapshotPublished = false;
           const handleEvent = (event: AgentEventLike) => {
+            if (event.type === "session_shutdown") {
+              cleanup(true);
+              return;
+            }
             if (!snapshotPublished) {
               bufferedEvents.push(event);
               return;
@@ -83,6 +92,11 @@ export function createAgentEventStream(
           const stopListening = session.onEvent(handleEvent);
           if (closed) {
             stopListening();
+            return;
+          }
+          if (session.isAlive && !session.isAlive()) {
+            stopListening();
+            cleanup(true);
             return;
           }
           unsubscribe = stopListening;

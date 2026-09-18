@@ -190,25 +190,26 @@ try {
   assert.equal(compacted.context.messages.some((entry) => entry.role === "user"), false);
   console.log("PASS: bounded history, branch context, pagination root, and API errors");
 
-  // #632 regression: a live in-memory wrapper used to shadow the session file,
-  // so entries appended by another pi process were invisible — even after a
-  // manual refresh. The wrapper must yield to what is actually on disk.
+  // #632 regression: a live wrapper shadows the session file. Ordinary reads
+  // keep that snapshot (two processes writing one JSONL is unsupported). A
+  // mount/refresh GET (?force=1) must see the external append and stay stable.
   {
     const file = join(sessionDir, `2026-08-23T00-00-00-000Z_${APPEND}.jsonl`);
-    // Warm a real wrapper so the shadowing code path is active.
     await post(`/api/agent/${APPEND}`, { type: "get_state" });
     const beforeAppend = await api(`/api/sessions/${APPEND}`);
     assert.deepEqual(beforeAppend.context.entryIds, ["root", "reply"], "the wrapper must serve its own snapshot first");
-    // Append exactly as the pi TUI would: one more JSONL entry, same file.
     appendFileSync(file, `${JSON.stringify(message("external", "reply", "assistant", "E2E external append"))}\n`);
-    const afterAppend = await api(`/api/sessions/${APPEND}`);
-    assert.deepEqual(afterAppend.context.entryIds, ["root", "reply", "external"], "an external append must become visible");
-    // A second read must stay correct rather than flap or re-evict forever.
+    const ordinaryRead = await api(`/api/sessions/${APPEND}`);
+    assert.deepEqual(ordinaryRead.context.entryIds, ["root", "reply"], "post-turn reads must not probe disk");
+    assert.equal(ordinaryRead.wrapperRebuilt, undefined);
+    const afterForce = await api(`/api/sessions/${APPEND}?force=1`);
+    assert.deepEqual(afterForce.context.entryIds, ["root", "reply", "external"], "a mount/refresh read must see the external append");
+    assert.equal(afterForce.wrapperRebuilt, true);
     const again = await api(`/api/sessions/${APPEND}`);
     assert.deepEqual(again.context.entryIds, ["root", "reply", "external"], "repeated reads must stay stable");
     const appended = await api(`/api/sessions/${APPEND}/context?tail=1`);
     assert.deepEqual(appended.context.entryIds, ["external"], "the appended entry must be readable on its own");
-    console.log("PASS: external session-file appends are visible despite a live wrapper");
+    console.log("PASS: external session-file appends are visible on force/mount reads");
   }
 
   browser = await chromium.launch();

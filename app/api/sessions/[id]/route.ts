@@ -10,7 +10,6 @@ import {
   invalidateSessionListCache,
   buildSessionContext,
   readSessionHeader,
-  readLatestSessionEntryId,
 } from "@/lib/session-reader";
 import { sessionPathKey } from "@/lib/session-path";
 import { getRpcSession } from "@/lib/rpc-manager";
@@ -28,23 +27,19 @@ export async function GET(
   const { id } = await params;
   try {
     const rpc = getRpcSession(id);
+    const searchParams = new URL(req.url).searchParams;
+    const force = searchParams.get("force") === "1";
 
     // A live wrapper only reflects the appends pi-web itself made. When another
-    // pi process (the TUI) writes the same session file, the wrapper's in-memory
-    // entries silently diverge from disk and every read — including a manual
-    // refresh — keeps serving the stale snapshot. Detect the newest on-disk
-    // entry the wrapper never saw and drop the wrapper, so this request rebuilds
-    // from the file instead of from memory. Only while idle: mid-run the wrapper
-    // owns the write path, so an external write then is the genuinely
-    // unsupported concurrent-write case rather than a stale read.
+    // pi process (the TUI) writes the same session file, the in-memory index
+    // stays stale. Only probe on ?force=1 (session mount / page refresh): two
+    // processes writing one JSONL is unsupported, so post-turn reads must not
+    // scan disk. Eviction is idle-only; mid-run the wrapper owns the write path.
     let liveWrapper = rpc?.isAlive() ? rpc : undefined;
-    if (liveWrapper && !liveWrapper.isRunning()) {
-      const diskLatestId = readLatestSessionEntryId(liveWrapper.sessionFile);
-      if (diskLatestId && !liveWrapper.inner.sessionManager.getEntry(diskLatestId)) {
-        liveWrapper.destroy();
-        invalidateSessionListCache();
-        liveWrapper = undefined;
-      }
+    let wrapperRebuilt = false;
+    if (force && liveWrapper?.evictIfDiskAhead()) {
+      wrapperRebuilt = true;
+      liveWrapper = undefined;
     }
     const liveRpc = liveWrapper;
     const resolvedPath = liveRpc ? null : await resolveSessionPath(id);
@@ -57,7 +52,6 @@ export async function GET(
     const entries = sm.getEntries();
     const leafId = sm.getLeafId();
     const tree = projectTreeForResponse(sm.getTree());
-    const searchParams = new URL(req.url).searchParams;
     const deferThinking = searchParams.has("deferThinking");
     const deferToolResultImages = searchParams.has("deferMedia");
     const rawTail = Number(searchParams.get("tail"));
@@ -121,6 +115,7 @@ export async function GET(
       stats,
       totalActiveMs,
       ...(toolNames !== undefined ? { toolNames } : {}),
+      ...(wrapperRebuilt ? { wrapperRebuilt: true } : {}),
     });
   } catch (error) {
     return NextResponse.json({ error: String(error) }, { status: 500 });
